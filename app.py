@@ -3,6 +3,12 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from data.generated_graph import node_list, edge_list
 from data.orders import orders
+import time
+import pandas as pd
+import psutil
+import plotly.express as px
+import plotly.graph_objects as go
+import os
 
 class CityGraph:
     def __init__(self):
@@ -47,6 +53,34 @@ class CityGraph:
                 return ((x2 - x1)**2 + (y2 - y1)**2)**0.5
             return nx.astar_path(self.graph, start, end, heuristic=heuristic, weight='weight')
 
+class EnhancedCityGraph(CityGraph):
+    def benchmark_order(self, order, algorithm):
+        try:
+            dest = order['destination']
+            start_time = time.time()
+            process = psutil.Process()
+            mem_before = process.memory_info().rss
+            
+            path = self.get_shortest_path(0, dest, algorithm)
+            
+            mem_after = process.memory_info().rss
+            end_time = time.time()
+            
+            distance = sum(self.graph[u][v]['distance'] for u,v in zip(path[:-1], path[1:]))
+            time_cost = sum(self.graph[u][v]['weight'] for u,v in zip(path[:-1], path[1:]))
+            
+            return {
+                'algorithm': algorithm,
+                'time': end_time - start_time,
+                'memory': (mem_after - mem_before),  # KB
+                'distance': distance,
+                'time_cost': time_cost,
+                'path': path,
+                'order_id': order['destination']
+            }
+        except nx.NetworkXNoPath:
+            return None
+
 def assign_orders(orders, vehicle_capacity):
     sorted_orders = sorted(orders, key=lambda x: (-x['priority'], x['deadline']))
     vehicles = []
@@ -85,7 +119,7 @@ def plot_network(graph, routes=None):
     return plt
 
 def main():
-    st.title("🛵 DeliveryCepat - Optimasi Rute Pengiriman")
+    st.title("🚚 DeliveryCepat - Optimasi Rute Pengiriman")
     graph = CityGraph()
     
     with st.sidebar:
@@ -106,7 +140,7 @@ def main():
                           key=lambda x: nx.dijkstra_path_length(graph.graph, 0, x)):
             path += graph.get_shortest_path(path[-1], dest, algorithm)[1:]
         all_routes.append(path)
-    
+
     # Visualization
     st.subheader("🗺️ Visualisasi Peta & Rute")
     fig = plot_network(graph, all_routes)
@@ -132,6 +166,100 @@ def main():
     for i, route in enumerate(all_routes, 1):
         locations = [graph.graph.nodes[n]['name'] for n in route]
         st.write(f"**Kendaraan {i}:** {' → '.join(locations)}")
+
+    #Analisis Komparatif Algoritma
+    def analyze_algorithms(graph, orders, vehicle_capacity, num_vehicles):
+        st.subheader("📊 Analisis Kualitas Algoritma")
+
+        # 1. Benchmark semua order yang valid
+        results = []
+        for order in orders:
+            dijkstra = graph.benchmark_order(order, "Dijkstra")
+            astar = graph.benchmark_order(order, "A*")
+            if dijkstra and astar:
+                results.extend([dijkstra, astar])
+
+        df = pd.DataFrame(results)
+
+        # 2. Visualisasi Metrik Utama
+        if not df.empty:
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = px.box(df, x='algorithm', y='time', 
+                            title='Waktu Komputasi per Algoritma')
+                st.plotly_chart(fig)
+
+            with col2:
+                fig = px.box(df, x='algorithm', y='memory',
+                            title='Penggunaan Memori per Algoritma')
+                st.plotly_chart(fig)
+
+            # 3. Analisis Kualitas Solusi
+            st.markdown("### Kualitas Solusi")
+            solution_df = df.groupby('algorithm').agg({
+                'distance': 'mean',
+                'time_cost': 'mean'
+            }).reset_index()
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=solution_df['algorithm'],
+                y=solution_df['distance'],
+                name='Jarak Rata-rata',
+                marker_color='indigo'
+            ))
+            fig.add_trace(go.Bar(
+                x=solution_df['algorithm'],
+                y=solution_df['time_cost'],
+                name='Waktu Rata-rata',
+                marker_color='royalblue'
+            ))
+            fig.update_layout(barmode='group', title='Perbandingan Kualitas Solusi')
+            st.plotly_chart(fig)
+
+            # 4. Analisis Skalabilitas
+            st.markdown("### Skalabilitas dengan Node")
+            scalability_data = []
+            node_counts = [10, 15, 20, 25, 29]
+
+            for n in node_counts:
+                valid_nodes = [node for node in graph.graph.nodes if node <= n]
+                subgraph = graph.graph.subgraph(valid_nodes)
+                target = min(n, max(valid_nodes))
+
+                try:
+                    start = time.time()
+                    nx.dijkstra_path(subgraph, 0, target)
+                    dijkstra_time = time.time() - start
+                except:
+                    dijkstra_time = None
+
+                try:
+                    start = time.time()
+                    nx.astar_path(subgraph, 0, target, heuristic=lambda u,v:0)
+                    astar_time = time.time() - start
+                except:
+                    astar_time = None
+
+                scalability_data.append({
+                    'nodes': n,
+                    'Dijkstra': dijkstra_time,
+                    'A*': astar_time
+                })
+
+            fig = px.line(pd.DataFrame(scalability_data), x='nodes', y=['Dijkstra', 'A*'],
+                         title='Skalabilitas dengan Peningkatan Node')
+            st.plotly_chart(fig)
+
+            # 5. Tabel Detail
+            st.markdown("### Data Detail Benchmark")
+            st.dataframe(df[['algorithm', 'order_id', 'time', 'memory', 'distance', 'time_cost']]
+                        .sort_values(['algorithm', 'order_id']))
+
+    # Panggil di main():
+    if st.sidebar.checkbox("Tampilkan Analisis Algoritma"):
+        enhanced_graph = EnhancedCityGraph()
+        analyze_algorithms(enhanced_graph, orders, vehicle_capacity, num_vehicles)
 
 if __name__ == "__main__":
     main()
