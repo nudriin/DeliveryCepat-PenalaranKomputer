@@ -9,6 +9,7 @@ import psutil
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import numpy as np
 
 class CityGraph:
     def __init__(self):
@@ -23,11 +24,13 @@ class CityGraph:
         
         for edge in edge_list:
             time_cost = (edge['distance'] / edge['speed']) * (1 + edge['congestion'])
+            cost = edge['distance'] * (1 + 0.5 * edge['congestion']) * 1000  # Scale to thousands of rupiah
             self.graph.add_edge(
                 edge['from'], 
                 edge['to'], 
                 weight=time_cost,
                 distance=edge['distance'],
+                cost=cost,  # Added cost attribute
                 label=f"{edge['distance']}km, {edge['speed']}km/h"
             )
             if not edge['oneway']:
@@ -36,6 +39,7 @@ class CityGraph:
                     edge['from'], 
                     weight=time_cost,
                     distance=edge['distance'],
+                    cost=cost,  # Added cost attribute
                     label=f"{edge['distance']}km, {edge['speed']}km/h"
                 )
 
@@ -44,37 +48,48 @@ class CityGraph:
         self.node_positions = pos
 
     def get_shortest_path(self, start, end, algorithm):
+        start_time = time.time()
+        process = psutil.Process()
+        mem_before = process.memory_info().rss
+        
         if algorithm == "Dijkstra":
-            return nx.dijkstra_path(self.graph, start, end, weight='weight')
+            path = nx.dijkstra_path(self.graph, start, end, weight='weight')
         elif algorithm == "A*":
             def heuristic(u, v):
                 x1, y1 = self.node_positions[u]
                 x2, y2 = self.node_positions[v]
                 return ((x2 - x1)**2 + (y2 - y1)**2)**0.5
-            return nx.astar_path(self.graph, start, end, heuristic=heuristic, weight='weight')
+            path = nx.astar_path(self.graph, start, end, heuristic=heuristic, weight='weight')
+        
+        mem_after = process.memory_info().rss
+        end_time = time.time()
+        
+        metrics = {
+            'time': end_time - start_time,
+            'memory': (mem_after - mem_before),
+            'path': path
+        }
+        
+        return path, metrics
 
 class EnhancedCityGraph(CityGraph):
     def benchmark_order(self, order, algorithm):
         try:
             dest = order['destination']
-            start_time = time.time()
-            process = psutil.Process()
-            mem_before = process.memory_info().rss
             
-            path = self.get_shortest_path(0, dest, algorithm)
-            
-            mem_after = process.memory_info().rss
-            end_time = time.time()
+            path, metrics = self.get_shortest_path(0, dest, algorithm)
             
             distance = sum(self.graph[u][v]['distance'] for u,v in zip(path[:-1], path[1:]))
             time_cost = sum(self.graph[u][v]['weight'] for u,v in zip(path[:-1], path[1:]))
+            cost = sum(self.graph[u][v]['cost'] for u,v in zip(path[:-1], path[1:]))
             
             return {
                 'algorithm': algorithm,
-                'time': end_time - start_time,
-                'memory': (mem_after - mem_before),  # KB
+                'time': metrics['time'],
+                'memory': metrics['memory'],
                 'distance': distance,
                 'time_cost': time_cost,
+                'cost': cost,  # Added cost metric
                 'path': path,
                 'order_id': order['destination']
             }
@@ -112,154 +127,254 @@ def plot_network(graph, routes=None):
         for i, path in enumerate(routes):
             edges = list(zip(path[:-1], path[1:]))
             nx.draw_networkx_edges(graph.graph, graph.node_positions, edgelist=edges,
-                                  edge_color=colors[i], width=2, alpha=0.8)
+                                  edge_color=colors[i % len(colors)], width=2, alpha=0.8)
     
     plt.title("Peta Jaringan Logistik")
     plt.axis('off')
     return plt
 
+def analyze_algorithm_performance(graph, orders, algorithm):
+    """Analyze performance of a single algorithm"""
+    st.subheader(f"📊 Analisis Kinerja Algoritma {algorithm}")
+    
+    # 1. Benchmark valid orders
+    results = []
+    with st.spinner(f"Menganalisis kinerja {algorithm}..."):
+        for order in orders:
+            result = graph.benchmark_order(order, algorithm)
+            if result:
+                results.append(result)
+    
+    if not results:
+        st.error("Tidak ada data hasil yang valid untuk dianalisis.")
+        return
+        
+    df = pd.DataFrame(results)
+    
+    # 2. Performance Metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Waktu Komputasi Rata-rata", f"{df['time'].mean():.5f} detik")
+    with col2:
+        st.metric("Memori Rata-rata", f"{df['memory'].mean()/1024:.2f} KB")
+    with col3:
+        st.metric("Jarak Rata-rata", f"{df['distance'].mean():.2f} km")
+    
+    # 3. Detailed Charts
+    st.subheader("Detail Metrik per Order")
+    
+    tab1, tab2, tab3 = st.tabs(["Waktu & Memori", "Kualitas Solusi", "Detail Data"])
+    
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.bar(df, x='order_id', y='time', 
+                        title=f'Waktu Komputasi ({algorithm})',
+                        labels={'order_id': 'ID Order', 'time': 'Waktu (detik)'})
+            fig.update_layout(xaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig)
+            
+        with col2:
+            fig = px.bar(df, x='order_id', y='memory', 
+                        title=f'Penggunaan Memori ({algorithm})',
+                        labels={'order_id': 'ID Order', 'memory': 'Memori (bytes)'})
+            fig.update_layout(xaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig)
+    
+    with tab2:
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.bar(df, x='order_id', y=['distance', 'time_cost', 'cost'], 
+                        title=f'Kualitas Solusi ({algorithm})',
+                        labels={'order_id': 'ID Order', 'value': 'Nilai', 
+                               'variable': 'Metrik'},
+                        barmode='group')
+            fig.update_layout(xaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig)
+        
+        with col2:
+            # Radar chart for solution quality comparison
+            metrics = ['distance', 'time_cost', 'cost']
+            avg_metrics = df[metrics].mean().tolist()
+            max_metrics = df[metrics].max().tolist()
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatterpolar(
+                r=avg_metrics,
+                theta=metrics,
+                fill='toself',
+                name='Rata-rata'
+            ))
+            fig.add_trace(go.Scatterpolar(
+                r=max_metrics,
+                theta=metrics,
+                fill='toself',
+                name='Maksimum'
+            ))
+            
+            fig.update_layout(
+                polar=dict(
+                    radialaxis=dict(
+                        visible=True,
+                    )),
+                showlegend=True,
+                title=f"Profil Kualitas Solusi ({algorithm})"
+            )
+            st.plotly_chart(fig)
+    
+    with tab3:
+        st.dataframe(df[['order_id', 'time', 'memory', 'distance', 'time_cost', 'cost']]
+                    .sort_values('order_id'))
+
+def analyze_scalability(graph, algorithm):
+    """Analyze scalability of a single algorithm with increasing nodes"""
+    st.subheader(f"🔍 Analisis Skalabilitas {algorithm}")
+    
+    # Prepare data
+    node_counts = list(range(5, len(graph.graph.nodes()), 5))
+    if node_counts[-1] != len(graph.graph.nodes()):
+        node_counts.append(len(graph.graph.nodes()))
+    
+    scalability_data = []
+    
+    with st.spinner(f"Menganalisis skalabilitas {algorithm}..."):
+        for n in node_counts:
+            valid_nodes = [node for node in graph.graph.nodes() if node < n]
+            if len(valid_nodes) < 2:  # Need at least 2 nodes
+                continue
+                
+            subgraph = graph.graph.subgraph(valid_nodes)
+            target = max(valid_nodes)
+            
+            try:
+                start_time = time.time()
+                process = psutil.Process()
+                mem_before = process.memory_info().rss
+                
+                if algorithm == "Dijkstra":
+                    nx.dijkstra_path(subgraph, 0, target)
+                else:  # A*
+                    def heuristic(u, v):
+                        x1, y1 = graph.node_positions[u]
+                        x2, y2 = graph.node_positions[v]
+                        return ((x2 - x1)**2 + (y2 - y1)**2)**0.5
+                    nx.astar_path(subgraph, 0, target, heuristic=heuristic)
+                
+                mem_after = process.memory_info().rss
+                end_time = time.time()
+                
+                scalability_data.append({
+                    'nodes': len(valid_nodes),
+                    'time': end_time - start_time,
+                    'memory': mem_after - mem_before
+                })
+            except:
+                pass
+    
+    # Display scalability charts
+    if scalability_data:
+        scalability_df = pd.DataFrame(scalability_data)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.line(scalability_df, x='nodes', y='time',
+                         markers=True,
+                         title=f'Waktu Komputasi vs Jumlah Node ({algorithm})',
+                         labels={'nodes': 'Jumlah Node', 'time': 'Waktu (detik)'})
+            st.plotly_chart(fig)
+        
+        with col2:
+            fig = px.line(scalability_df, x='nodes', y='memory',
+                         markers=True,
+                         title=f'Penggunaan Memori vs Jumlah Node ({algorithm})',
+                         labels={'nodes': 'Jumlah Node', 'memory': 'Memori (bytes)'})
+            st.plotly_chart(fig)
+        
+        # Show scalability data table
+        st.subheader("Data Skalabilitas")
+        st.dataframe(scalability_df)
+    else:
+        st.error("Tidak dapat menganalisis skalabilitas dengan jaringan saat ini.")
+
 def main():
     st.title("🚚 DeliveryCepat - Optimasi Rute Pengiriman")
-    graph = CityGraph()
+    
+    # Initialize graph
+    graph = EnhancedCityGraph()
     
     with st.sidebar:
         st.header("⚙️ Parameter")
         algorithm = st.selectbox("Algoritma", ["Dijkstra", "A*"])
         vehicle_capacity = st.slider("Kapasitas Kendaraan (ton)", 10, 50, 20)
         num_vehicles = st.slider("Jumlah Kendaraan", 1, 10, 3)
+        
+        st.header("📈 Analisis")
+        show_performance = st.checkbox("Tampilkan Analisis Kinerja")
+        show_scalability = st.checkbox("Tampilkan Analisis Skalabilitas")
     
     # Assign orders to vehicles
     vehicles = assign_orders(orders, vehicle_capacity)
     
-    # Calculate routes
+    # Calculate routes with performance metrics
     all_routes = []
+    total_metrics = {'time': 0, 'memory': 0, 'distance': 0, 'time_cost': 0, 'cost': 0}
+    
     for vehicle in vehicles[:num_vehicles]:
         destinations = [o['destination'] for o in vehicle]
         path = [0]
-        for dest in sorted(destinations, 
-                          key=lambda x: nx.dijkstra_path_length(graph.graph, 0, x)):
-            path += graph.get_shortest_path(path[-1], dest, algorithm)[1:]
+        vehicle_metrics = {'time': 0, 'memory': 0, 'distance': 0, 'time_cost': 0, 'cost': 0}
+        
+        for dest in sorted(destinations):
+            next_path, metrics = graph.get_shortest_path(path[-1], dest, algorithm)
+            path += next_path[1:]  # Skip first node as it's already in the path
+            
+            # Accumulate metrics
+            vehicle_metrics['time'] += metrics['time']
+            vehicle_metrics['memory'] += metrics['memory']
+            
+            # Calculate path metrics
+            segment = next_path
+            vehicle_metrics['distance'] += sum(graph.graph[u][v]['distance'] for u, v in zip(segment[:-1], segment[1:]))
+            vehicle_metrics['time_cost'] += sum(graph.graph[u][v]['weight'] for u, v in zip(segment[:-1], segment[1:]))
+            vehicle_metrics['cost'] += sum(graph.graph[u][v]['cost'] for u, v in zip(segment[:-1], segment[1:]))
+        
         all_routes.append(path)
-
+        
+        # Add vehicle metrics to total
+        for key in total_metrics:
+            total_metrics[key] += vehicle_metrics[key]
+    
     # Visualization
     st.subheader("🗺️ Visualisasi Peta & Rute")
     fig = plot_network(graph, all_routes)
     st.pyplot(fig)
     
-    # Metrics
+    # Performance Overview
     st.subheader("📊 Dashboard Kinerja")
-    total_time = sum(
-        sum(graph.graph[u][v]['weight'] for u, v in zip(route[:-1], route[1:]))
-        for route in all_routes
-    )
-    total_distance = sum(
-        sum(graph.graph[u][v]['distance'] for u, v in zip(route[:-1], route[1:]))
-        for route in all_routes
-    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Waktu Tempuh", f"{total_metrics['time_cost']:.2f} jam")
+    col2.metric("Total Jarak Tempuh", f"{total_metrics['distance']:.2f} km")
+    col3.metric("Total Biaya", f"Rp {total_metrics['cost']:,.0f}")
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Waktu Tempuh", f"{total_time:.2f} jam")
-    col2.metric("Total Jarak Tempuh", f"{total_distance:.2f} km")
+    col1.metric("Waktu Komputasi", f"{total_metrics['time']:.5f} detik")
+    col2.metric("Penggunaan Memori", f"{total_metrics['memory']/1024:.2f} KB")
     col3.metric("Kendaraan Digunakan", len(all_routes))
     
+    # Route Details
     st.subheader("📦 Detail Pengiriman")
     for i, route in enumerate(all_routes, 1):
         locations = [graph.graph.nodes[n]['name'] for n in route]
         st.write(f"**Kendaraan {i}:** {' → '.join(locations)}")
-
-    #Analisis Komparatif Algoritma
-    def analyze_algorithms(graph, orders, vehicle_capacity, num_vehicles):
-        st.subheader("📊 Analisis Kualitas Algoritma")
-
-        # 1. Benchmark semua order yang valid
-        results = []
-        for order in orders:
-            dijkstra = graph.benchmark_order(order, "Dijkstra")
-            astar = graph.benchmark_order(order, "A*")
-            if dijkstra and astar:
-                results.extend([dijkstra, astar])
-
-        df = pd.DataFrame(results)
-
-        # 2. Visualisasi Metrik Utama
-        if not df.empty:
-            col1, col2 = st.columns(2)
-            with col1:
-                fig = px.box(df, x='algorithm', y='time', 
-                            title='Waktu Komputasi per Algoritma')
-                st.plotly_chart(fig)
-
-            with col2:
-                fig = px.box(df, x='algorithm', y='memory',
-                            title='Penggunaan Memori per Algoritma')
-                st.plotly_chart(fig)
-
-            # 3. Analisis Kualitas Solusi
-            st.markdown("### Kualitas Solusi")
-            solution_df = df.groupby('algorithm').agg({
-                'distance': 'mean',
-                'time_cost': 'mean'
-            }).reset_index()
-
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=solution_df['algorithm'],
-                y=solution_df['distance'],
-                name='Jarak Rata-rata',
-                marker_color='indigo'
-            ))
-            fig.add_trace(go.Bar(
-                x=solution_df['algorithm'],
-                y=solution_df['time_cost'],
-                name='Waktu Rata-rata',
-                marker_color='royalblue'
-            ))
-            fig.update_layout(barmode='group', title='Perbandingan Kualitas Solusi')
-            st.plotly_chart(fig)
-
-            # 4. Analisis Skalabilitas
-            st.markdown("### Skalabilitas dengan Node")
-            scalability_data = []
-            node_counts = [10, 15, 20, 25, 29]
-
-            for n in node_counts:
-                valid_nodes = [node for node in graph.graph.nodes if node <= n]
-                subgraph = graph.graph.subgraph(valid_nodes)
-                target = min(n, max(valid_nodes))
-
-                try:
-                    start = time.time()
-                    nx.dijkstra_path(subgraph, 0, target)
-                    dijkstra_time = time.time() - start
-                except:
-                    dijkstra_time = None
-
-                try:
-                    start = time.time()
-                    nx.astar_path(subgraph, 0, target, heuristic=lambda u,v:0)
-                    astar_time = time.time() - start
-                except:
-                    astar_time = None
-
-                scalability_data.append({
-                    'nodes': n,
-                    'Dijkstra': dijkstra_time,
-                    'A*': astar_time
-                })
-
-            fig = px.line(pd.DataFrame(scalability_data), x='nodes', y=['Dijkstra', 'A*'],
-                         title='Skalabilitas dengan Peningkatan Node')
-            st.plotly_chart(fig)
-
-            # 5. Tabel Detail
-            st.markdown("### Data Detail Benchmark")
-            st.dataframe(df[['algorithm', 'order_id', 'time', 'memory', 'distance', 'time_cost']]
-                        .sort_values(['algorithm', 'order_id']))
-
-    # Panggil di main():
-    if st.sidebar.checkbox("Tampilkan Analisis Algoritma"):
-        enhanced_graph = EnhancedCityGraph()
-        analyze_algorithms(enhanced_graph, orders, vehicle_capacity, num_vehicles)
+    
+    # Performance Analysis
+    if show_performance:
+        analyze_algorithm_performance(graph, orders, algorithm)
+    
+    # Scalability Analysis
+    if show_scalability:
+        analyze_scalability(graph, algorithm)
 
 if __name__ == "__main__":
     main()
