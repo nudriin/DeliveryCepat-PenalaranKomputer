@@ -227,6 +227,61 @@ def analyze_algorithm_performance(graph, orders, algorithm):
         st.dataframe(df[['order_id', 'time', 'memory', 'distance', 'time_cost', 'cost']]
                     .sort_values('order_id'))
 
+def calculate_min_vehicles(orders, vehicle_capacity):
+    """Menghitung jumlah minimal kendaraan yang dibutuhkan"""
+    total_weight = sum(o['weight'] for o in orders if o['weight'] <= vehicle_capacity)
+    
+    # Hitung berdasarkan bin packing dengan prioritas
+    sorted_orders = sorted(
+        [o for o in orders if o['weight'] <= vehicle_capacity],
+        key=lambda x: (-x['priority'], x['deadline'])
+    )
+    
+    vehicles = []
+    current_load = 0
+    
+    for order in sorted_orders:
+        if current_load + order['weight'] <= vehicle_capacity:
+            current_load += order['weight']
+        else:
+            vehicles.append(1)
+            current_load = order['weight']
+    
+    if current_load > 0:
+        vehicles.append(1)
+    
+    return max(len(vehicles), int(np.ceil(total_weight / vehicle_capacity)))
+
+def assign_orders(orders, vehicle_capacity):
+    """Mengembalikan (vehicles, unassigned_orders)"""
+    valid_orders = [o for o in orders if o['weight'] <= vehicle_capacity]
+    invalid_orders = [{'id': o['id'], 'reason': 'capacity'} for o in orders if o['weight'] > vehicle_capacity]
+    
+    sorted_orders = sorted(valid_orders, key=lambda x: (-x['priority'], x['deadline']))
+    
+    vehicles = []
+    current_vehicle = []
+    current_load = 0
+    
+    for order in sorted_orders:
+        if current_load + order['weight'] <= vehicle_capacity:
+            current_vehicle.append(order)
+            current_load += order['weight']
+        else:
+            vehicles.append(current_vehicle)
+            current_vehicle = [order]
+            current_load = order['weight']
+    
+    if current_vehicle:
+        vehicles.append(current_vehicle)
+    
+    # Cek jika masih ada order yang belum teralokasi
+    assigned_ids = {o['id'] for vehicle in vehicles for o in vehicle}
+    unassigned = [{'id': o['id'], 'reason': 'vehicle_limit'} 
+                 for o in sorted_orders if o['id'] not in assigned_ids]
+    
+    return vehicles, invalid_orders + unassigned
+
 def analyze_scalability(graph, algorithm):
     """Analyze scalability of a single algorithm with increasing nodes"""
     st.subheader(f"🔍 Analisis Skalabilitas {algorithm}")
@@ -306,46 +361,63 @@ def main():
     with st.sidebar:
         st.header("⚙️ Parameter")
         algorithm = st.selectbox("Algoritma", ["Dijkstra", "A*"])
-        vehicle_capacity = st.slider("Kapasitas Kendaraan (ton)", 10, 50, 20)
-        num_vehicles = st.slider("Jumlah Kendaraan", 1, 10, 3)
+        vehicle_capacity = st.slider(
+            "Kapasitas Kendaraan (ton)", 
+            min_value=15,  # Batas minimal 15 ton
+            max_value=50, 
+            value=20
+        )
         
         st.header("📈 Analisis")
         show_performance = st.checkbox("Tampilkan Analisis Kinerja")
         show_scalability = st.checkbox("Tampilkan Analisis Skalabilitas")
     
-    # Assign orders to vehicles
-    vehicles = assign_orders(orders, vehicle_capacity)
+    # Hitung jumlah kendaraan yang dibutuhkan
+    min_vehicles = calculate_min_vehicles(orders, vehicle_capacity)
     
-    # Calculate routes with performance metrics
+    # Assign orders ke kendaraan
+    assigned_vehicles, unassigned_orders = assign_orders(orders, vehicle_capacity)
+    
+    # Tampilkan informasi alokasi
+    st.subheader(f"📦 Alokasi Pengiriman (Membutuhkan {min_vehicles} Kendaraan)")
+    
+    # Tampilkan peringatan untuk order yang tidak teralokasi
+    if unassigned_orders:
+        st.error(f"⚠️ {len(unassigned_orders)} order tidak dapat diproses:")
+        reasons = {
+            'capacity': "melebihi kapasitas kendaraan",
+            'vehicle_limit': "keterbatasan jumlah kendaraan"
+        }
+        for order in unassigned_orders:
+            st.write(f"- Order {order['id']} ({reasons[order['reason']]})")
+    
+    # Hitung rute untuk semua kendaraan
     all_routes = []
     total_metrics = {'time': 0, 'memory': 0, 'distance': 0, 'time_cost': 0, 'cost': 0}
     
-    for vehicle in vehicles[:num_vehicles]:
+    for vehicle in assigned_vehicles:
         destinations = [o['destination'] for o in vehicle]
         path = [0]
         vehicle_metrics = {'time': 0, 'memory': 0, 'distance': 0, 'time_cost': 0, 'cost': 0}
         
         for dest in sorted(destinations):
             next_path, metrics = graph.get_shortest_path(path[-1], dest, algorithm)
-            path += next_path[1:]  # Skip first node as it's already in the path
+            path += next_path[1:]
             
-            # Accumulate metrics
+            # Akumulasi metrik
             vehicle_metrics['time'] += metrics['time']
             vehicle_metrics['memory'] += metrics['memory']
-            
-            # Calculate path metrics
-            segment = next_path
-            vehicle_metrics['distance'] += sum(graph.graph[u][v]['distance'] for u, v in zip(segment[:-1], segment[1:]))
-            vehicle_metrics['time_cost'] += sum(graph.graph[u][v]['weight'] for u, v in zip(segment[:-1], segment[1:]))
-            vehicle_metrics['cost'] += sum(graph.graph[u][v]['cost'] for u, v in zip(segment[:-1], segment[1:]))
+            vehicle_metrics['distance'] += sum(graph.graph[u][v]['distance'] for u, v in zip(next_path[:-1], next_path[1:]))
+            vehicle_metrics['time_cost'] += sum(graph.graph[u][v]['weight'] for u, v in zip(next_path[:-1], next_path[1:]))
+            vehicle_metrics['cost'] += sum(graph.graph[u][v]['cost'] for u, v in zip(next_path[:-1], next_path[1:]))
         
         all_routes.append(path)
         
-        # Add vehicle metrics to total
+        # Tambahkan ke total metrik
         for key in total_metrics:
             total_metrics[key] += vehicle_metrics[key]
     
-    # Visualization
+    # Visualisasi
     st.subheader("🗺️ Visualisasi Peta & Rute")
     fig = plot_network(graph, all_routes)
     st.pyplot(fig)
@@ -360,19 +432,18 @@ def main():
     col1, col2, col3 = st.columns(3)
     col1.metric("Waktu Komputasi", f"{total_metrics['time']:.5f} detik")
     col2.metric("Penggunaan Memori", f"{total_metrics['memory']/1024:.2f} KB")
-    col3.metric("Kendaraan Digunakan", len(all_routes))
+    col3.metric("Kendaraan Digunakan", len(assigned_vehicles))
     
-    # Route Details
-    st.subheader("📦 Detail Pengiriman")
+    # Detail Rute
+    st.subheader("📋 Detail Pengiriman")
     for i, route in enumerate(all_routes, 1):
         locations = [graph.graph.nodes[n]['name'] for n in route]
         st.write(f"**Kendaraan {i}:** {' → '.join(locations)}")
     
-    # Performance Analysis
+    # Analisis tambahan
     if show_performance:
         analyze_algorithm_performance(graph, orders, algorithm)
     
-    # Scalability Analysis
     if show_scalability:
         analyze_scalability(graph, algorithm)
 
